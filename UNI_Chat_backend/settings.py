@@ -117,7 +117,7 @@ CACHES = {
 }
 
 # Custom User Model (commented out until we create the authentication app)
-# AUTH_USER_MODEL = 'authentication.User'
+AUTH_USER_MODEL = 'authentication.User'
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
