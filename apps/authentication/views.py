@@ -9,7 +9,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
-
+from django.contrib.auth import authenticate
 from .models import Student, User
 
 
@@ -230,5 +230,103 @@ def set_password(request):
         return Response({
             'error': 'Failed to create account. Please try again.'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# Add this to your apps/authentication/views.py (after the set_password function)
+
+from django.contrib.auth import authenticate
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def login(request):
+    """
+    Smart Authentication Step 2B: Login for Existing Users
+    
+    How it works:
+    1. Frontend shows login form (from check_email response)
+    2. User enters email + password
+    3. API authenticates credentials
+    4. Generates fresh JWT tokens
+    5. Returns tokens + user info
+    
+    API Call:
+    POST /api/v1/auth/login/
+    {
+        "email": "rjoshi@abc.edu",
+        "password": "SecurePassword123!"
+    }
+    
+    Response:
+    - Success: User data + JWT tokens
+    - Error: Invalid credentials
+    """
+    
+    # Get data from request
+    print(f"🔍 Login attempt received")
+    email = request.data.get('email', '').lower().strip()
+    password = request.data.get('password', '')
+    
+    # Basic validation
+    if not email or not password:
+        return Response({
+            'error': 'Email and password are required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        # Authenticate user credentials
+        # Django will use your custom USERNAME_FIELD (email) for authentication
+        user = authenticate(request, username=email, password=password)
+        
+        if user is not None:
+            # Authentication successful
+            if user.is_active:
+                print(f"✅ Successful login for: {user.student.unique_id}")
+                
+                # Generate fresh JWT tokens
+                refresh = RefreshToken.for_user(user)
+                access_token = refresh.access_token
+                
+                # Update last login timestamp (Django does this automatically, but being explicit)
+
+                
+                print(f"🔑 Fresh JWT tokens generated for: {user.student.unique_id}")
+                
+                # Return success response
+                return Response({
+                    'message': f'Welcome back, {user.first_name}!',
+                    'user': {
+                        'id': user.id,
+                        'email': user.email,
+                        'name': f"{user.first_name} {user.last_name}",
+                        'student_id': user.student.unique_id,
+                        'university': user.student.university.name,
+                        'university_domain': user.student.university.domain,
+                        'last_login': user.last_login.isoformat() if user.last_login else None,
+                        'password_set_at': user.password_set_at.isoformat() if user.password_set_at else None
+                    },
+                    'tokens': {
+                        'access': str(access_token),
+                        'refresh': str(refresh)
+                    }
+                }, status=status.HTTP_200_OK)
+            else:
+                # User account is deactivated
+                print(f"⚠️ Login attempt for deactivated account: {email}")
+                return Response({
+                    'error': 'Your account has been deactivated. Please contact support.'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+        else:
+            # Authentication failed - wrong password or email not found
+            print(f"❌ Failed login attempt for: {email}")
+            return Response({
+                'error': 'Invalid email or password. Please check your credentials and try again.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+            
+    except Exception as e:
+        print(f"💥 Unexpected error during login: {str(e)}")
+        return Response({
+            'error': 'Login failed. Please try again.'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 # Create your views here.
-# (keeping the original comment for reference)
+# (keeping the original comment for reference)  

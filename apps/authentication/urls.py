@@ -17,4 +17,5 @@ urlpatterns = [
     # POST /api/v1/auth/set-password/
     path('check-email/', views.check_email, name='check_email'),
     path('set-password/', views.set_password, name='set_password'),
+     path('login/', views.login, name='login'),
     ]
