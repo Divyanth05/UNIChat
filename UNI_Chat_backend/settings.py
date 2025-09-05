@@ -198,6 +198,7 @@ if USE_S3:
     MEDIA_URL = f'https://{AWS_S3_CUSTOM_DOMAIN}/media/'
 else:
     # Local file storage
+    
     STATIC_URL = '/static/'
     MEDIA_URL = '/media/'
     MEDIA_ROOT = BASE_DIR / 'media'
@@ -228,6 +229,31 @@ OPENAI_API_KEY = config('OPENAI_API_KEY', default='')
 # File Upload Settings
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
+FILE_UPLOAD_PERMISSIONS = 0o644
+
+# Allowed file types for chat
+ALLOWED_FILE_EXTENSIONS = [
+    # Images
+    'jpg', 'jpeg', 'png', 'gif', 'webp',
+    # Documents  
+    'pdf', 'doc', 'docx', 'txt', 'csv'
+]
+
+ALLOWED_MIME_TYPES = [
+    # Images
+    'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+    # Documents
+    'application/pdf', 'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'text/plain', 'text/csv'
+]
+
+# File size limits
+MAX_FILE_SIZE = 10 * 1024 * 1024      # 10MB general limit
+MAX_IMAGE_SIZE = 5 * 1024 * 1024      # 5MB for images
+
+# Security Settings (this line should already exist)
+
 
 # Security Settings
 if not DEBUG:

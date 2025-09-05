@@ -10,12 +10,33 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from django.contrib.auth import authenticate
-from .models import Student, User
+from .models import Student, User ,University
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework.permissions import IsAdminUser
+import csv
+import io
+import re
+from apps.chat.cache_utils import cache_user_auth, invalidate_user_auth_cache, refresh_user_auth_cache
+from django.db import transaction
+from django.utils import timezone
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+from channels.db import database_sync_to_async
+from asgiref.sync import sync_to_async
+from django.db import transaction
+from django.utils import timezone
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+from channels.db import database_sync_to_async
+from asgiref.sync import sync_to_async
 
 
+#USER AUTHENTICATION END POINTS
 @api_view(['POST'])
 @permission_classes([AllowAny])
-def check_email(request):
+async def check_email(request):
     """
     Smart Authentication Step 1: Check if email exists and determine next action
     
@@ -53,7 +74,7 @@ def check_email(request):
     
     try:
         # Step 1: Check if student exists with this email
-        student = Student.objects.select_related('university').get(email=email) 
+        student = await Student.objects.select_related('university').get(email=email) 
         #how university name  is fetched ny using joins by django . it similar to join in sql. equilavent to student= students.objects.get(email=email) and university_name=student.university.name
         #Get the student AND their university data in ONE database query using a JOIN, so I don't have to make a second query later.
         print(f"✅ Student found: {student.unique_id} - {student.first_name} {student.last_name}")
@@ -62,6 +83,8 @@ def check_email(request):
         user_exists = User.objects.filter(student=student).exists()
         
         if user_exists:
+            user = User.objects.get(student=student)
+            cache_user_auth(user, timeout=1800)
             # Case A: User account exists - needs login
             print(f"🔑 User account exists for {student.unique_id} - directing to login")
             return Response({
@@ -194,6 +217,8 @@ def set_password(request):
             user.save()
             
             print(f"✅ User account created successfully for: {student.unique_id}")
+            # Cache user immediately after account creation
+            cache_user_auth(user, timeout=1800)  # Cache for 30 minutes
             
             # Generate JWT tokens
             refresh = RefreshToken.for_user(user)
@@ -281,27 +306,25 @@ def login(request):
         if user is not None:
             # Authentication successful
             if user.is_active:
-                print(f"✅ Successful login for: {user.student.unique_id}")
+                # Handle both admin and student users
+                user_info = user.student.unique_id if user.student else "admin"
+                print(f"✅ Successful login for: {user_info}")
+                 # Cache user data after successful login
+                cache_user_auth(user, timeout=1800)  # Cache for 30 minutes
                 
                 # Generate fresh JWT tokens
                 refresh = RefreshToken.for_user(user)
                 access_token = refresh.access_token
                 
-                # Update last login timestamp (Django does this automatically, but being explicit)
-
+                print(f"🔑 Fresh JWT tokens generated for: {user_info}")
                 
-                print(f"🔑 Fresh JWT tokens generated for: {user.student.unique_id}")
-                
-                # Return success response
-                return Response({
+                # Build response data
+                response_data = {
                     'message': f'Welcome back, {user.first_name}!',
                     'user': {
                         'id': user.id,
                         'email': user.email,
                         'name': f"{user.first_name} {user.last_name}",
-                        'student_id': user.student.unique_id,
-                        'university': user.student.university.name,
-                        'university_domain': user.student.university.domain,
                         'last_login': user.last_login.isoformat() if user.last_login else None,
                         'password_set_at': user.password_set_at.isoformat() if user.password_set_at else None
                     },
@@ -309,7 +332,17 @@ def login(request):
                         'access': str(access_token),
                         'refresh': str(refresh)
                     }
-                }, status=status.HTTP_200_OK)
+                }
+                
+                # Add student info only if user has a student record
+                if user.student:
+                    response_data['user']['student_id'] = user.student.unique_id
+                    response_data['user']['university'] = user.student.university.name
+                    response_data['user']['university_domain'] = user.student.university.domain
+                else:
+                    response_data['user']['user_type'] = 'admin'
+                
+                return Response(response_data, status=status.HTTP_200_OK)
             else:
                 # User account is deactivated
                 print(f"⚠️ Login attempt for deactivated account: {email}")
@@ -328,5 +361,318 @@ def login(request):
         return Response({
             'error': 'Login failed. Please try again.'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-# Create your views here.
-# (keeping the original comment for reference)  
+
+#ADMIN AUTHENTICATION END POINTS
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def add_university(request):
+    """
+    Add new university with 3-letter code
+    
+    POST /api/v1/auth/admin/add-university/
+    {
+        "university_code": "xyz",
+        "university_name": "XYZ College"
+    }
+    """
+    
+    university_code = request.data.get('university_code', '').lower().strip()
+    university_name = request.data.get('university_name', '').strip()
+    
+    # Validate inputs
+    if not university_code or not university_name:
+        return Response({
+            'error': 'Both university_code and university_name are required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Validate 3-letter code
+    if not re.match(r'^[a-z]{3}$', university_code):
+        return Response({
+            'error': 'University code must be exactly 3 letters (a-z only)'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Check if university exists
+    domain = f"{university_code}.edu"
+    from .models import University
+    
+    if University.objects.filter(domain=domain).exists():
+        return Response({
+            'error': f'University with code "{university_code}" already exists'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    if University.objects.filter(name__iexact=university_name).exists():
+        return Response({
+            'error': f'University with name "{university_name}" already exists'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        # Create university
+        university = University.objects.create(
+            name=university_name,
+            domain=domain,
+            is_active=True
+        )
+        
+        print(f"University created: {university.name} ({university.domain})")
+        
+        return Response({
+            'message': f'University "{university.name}" created successfully',
+            'university': {
+                'id': university.id,
+                'name': university.name,
+                'domain': university.domain,
+                'created_at': university.created_at.isoformat()
+            }
+        }, status=status.HTTP_201_CREATED)
+        
+    except Exception as e:
+        print(f"Error creating university: {str(e)}")
+        return Response({
+            'error': 'Failed to create university. Please try again.'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def upload_students(request):
+    """
+    Upload students via CSV to existing university
+    
+    POST /api/v1/auth/admin/upload-students/
+    {
+        "university_id": 1,
+        "csv_data": "first_name,last_name\nJohn,Doe\nJane,Smith"
+    }
+    
+    Or with university domain:
+    {
+        "university_domain": "abc.edu",
+        "csv_data": "first_name,last_name\nJohn,Doe\nJane,Smith"
+    }
+    """
+    
+    university_id = request.data.get('university_id')
+    university_domain = request.data.get('university_domain')
+    csv_data = request.data.get('csv_data', '').strip()
+    
+    # Validate inputs
+    if not (university_id or university_domain):
+        return Response({
+            'error': 'Either university_id or university_domain is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    if not csv_data:
+        return Response({
+            'error': 'csv_data is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        # Get university
+       
+        
+        if university_id:
+            university = University.objects.get(id=university_id, is_active=True)
+        else:
+            university = University.objects.get(domain=university_domain, is_active=True)
+            
+        print(f"Processing students for: {university.name}")
+        
+    except University.DoesNotExist:
+        return Response({
+            'error': 'University not found or inactive'
+        }, status=status.HTTP_404_NOT_FOUND)
+    
+    try:
+        # Process CSV
+        created_count = process_student_csv(csv_data, university)
+        
+        print(f"Created {created_count} students for {university.name}")
+        
+        return Response({
+            'message': f'Successfully created {created_count} students for {university.name}',
+            'university': university.name,
+            'students_created': created_count,
+            'next_student_id': get_next_student_id(university)
+        }, status=status.HTTP_201_CREATED)
+        
+    except ValidationError as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_400_BAD_REQUEST)
+        
+    except Exception as e:
+        print(f"Error processing CSV: {str(e)}")
+        return Response({
+            'error': 'Failed to process CSV data. Please check format and try again.'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def list_universities(request):
+    """
+    List all universities for dropdown selection
+    
+    GET /api/v1/auth/admin/universities/
+    """
+    
+
+    
+    universities = University.objects.filter(is_active=True).order_by('name')
+    
+    university_list = []
+    for university in universities:
+        student_count = university.students.count()
+        university_list.append({
+            'id': university.id,
+            'name': university.name,
+            'domain': university.domain,
+            'student_count': student_count,
+            'next_student_id': get_next_student_id(university)
+        })
+    
+    return Response({
+        'universities': university_list,
+        'total_count': len(university_list)
+    })
+
+
+# ADD THESE HELPER FUNCTIONS at the end of your views.py file
+
+def process_student_csv(csv_data, university):
+    """Process CSV data and create students"""
+    
+    # Parse CSV
+    csv_reader = csv.DictReader(io.StringIO(csv_data))
+    
+    # Validate headers
+    required_fields = {'first_name', 'last_name'}
+    if not required_fields.issubset(set(csv_reader.fieldnames)):
+        raise ValidationError(f'CSV must contain columns: {", ".join(required_fields)}')
+    
+    students_to_create = []
+    
+    # Validate data
+    for row_num, row in enumerate(csv_reader, start=2):
+        first_name = row['first_name'].strip()
+        last_name = row['last_name'].strip()
+        
+        if not first_name or not last_name:
+            continue  # Skip empty rows
+        
+        # Validate name format
+        if not re.match(r'^[a-zA-Z\s\-\'\.]+$', first_name) or not re.match(r'^[a-zA-Z\s\-\'\.]+$', last_name):
+            raise ValidationError(f'Row {row_num}: Names can only contain letters, spaces, hyphens, apostrophes, and periods')
+        
+        students_to_create.append({
+            'first_name': first_name,
+            'last_name': last_name,
+            'row_num': row_num
+        })
+    
+    if not students_to_create:
+        raise ValidationError('No valid student records found in CSV')
+    
+    # Create students in transaction
+    created_count = 0
+    
+    with transaction.atomic():
+        for student_data in students_to_create:
+            # Generate unique ID
+            unique_id = get_next_student_id(university)
+            
+            # Create student
+ 
+            student, created = Student.objects.get_or_create(
+                unique_id=unique_id,
+                defaults={
+                    'first_name': student_data['first_name'],
+                    'last_name': student_data['last_name'],
+                    'university': university
+                }
+            )
+            
+            if created:
+                created_count += 1
+                print(f"Created: {student.unique_id} - {student.first_name} {student.last_name} ({student.email})")
+    
+    return created_count
+
+
+def get_next_student_id(university):
+    """Generate next available student ID for university"""
+    domain_prefix = university.domain.split('.')[0].lower()
+    
+ 
+    existing_students = Student.objects.filter(
+        university=university,
+        unique_id__startswith=domain_prefix
+    ).order_by('unique_id')
+    
+    if not existing_students.exists():
+        return f"{domain_prefix}1"
+    
+    # Find highest number
+    highest_num = 0
+    pattern = re.compile(f'^{domain_prefix}(\d+)$')
+    
+    for student in existing_students:
+        match = pattern.match(student.unique_id)
+        if match:
+            num = int(match.group(1))
+            highest_num = max(highest_num, num)
+    
+    return f"{domain_prefix}{highest_num + 1}"
+
+
+#logout endpoint
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout(request):
+    """
+    Logout endpoint - Blacklist refresh token
+    
+    POST /api/v1/auth/logout/
+    {
+        "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    }
+    
+    Response:
+    - Success: Logout confirmation message
+    - Error: Invalid/expired token
+    """
+    
+    try:
+        refresh_token = request.data.get('refresh_token')
+        
+        if not refresh_token:
+            return Response({
+                'error': 'Refresh token is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        # Invalidate user cache on logout
+        invalidate_user_auth_cache(request.user.id)
+        # Blacklist the refresh token
+        token = RefreshToken(refresh_token)
+        token.blacklist()
+        
+        # Log successful logout
+        user_info = "admin" if not request.user.student else request.user.student.unique_id
+        print(f"User logged out successfully: {user_info}")
+        
+        return Response({
+            'message': 'Logged out successfully. See you soon!'
+        }, status=status.HTTP_200_OK)
+        
+    except TokenError as e:
+        print(f"Token error during logout: {str(e)}")
+        return Response({
+            'error': 'Invalid or expired token'
+        }, status=status.HTTP_400_BAD_REQUEST)
+        
+    except Exception as e:
+        print(f"Unexpected error during logout: {str(e)}")
+        return Response({
+            'error': 'Logout failed. Please try again.'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

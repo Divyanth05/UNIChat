@@ -1,16 +1,29 @@
 """
 ASGI config for UNI_Chat_backend project.
-
-It exposes the ASGI callable as a module-level variable named ``application``.
-
-For more information on this file, see
-https://docs.djangoproject.com/en/4.2/howto/deployment/asgi/
 """
 
 import os
-
+import django
 from django.core.asgi import get_asgi_application
 
+# Set up Django
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'UNI_Chat_backend.settings')
+django.setup()
 
-application = get_asgi_application()
+# Import after Django is set up
+from channels.routing import ProtocolTypeRouter, URLRouter
+from channels.security.websocket import AllowedHostsOriginValidator
+from apps.chat.middleware import JWTAuthMiddlewareStack
+from apps.chat.routing import websocket_urlpatterns
+
+application = ProtocolTypeRouter({
+    "http": get_asgi_application(),
+    
+    "websocket": AllowedHostsOriginValidator(
+        JWTAuthMiddlewareStack(
+            URLRouter(
+                websocket_urlpatterns
+            )
+        )
+    ),
+})

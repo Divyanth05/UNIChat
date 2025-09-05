@@ -149,8 +149,11 @@ class User(AbstractUser):
     student = models.OneToOneField(
         Student,
         on_delete=models.CASCADE,
+        null=True,         
+        blank=True,
         related_name='user_account',
         help_text='Student record this user account belongs to'
+        
     )
     
     # Override email to use student's email
@@ -190,7 +193,11 @@ class User(AbstractUser):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"{self.email} ({self.student.unique_id})"
+        if self.student:
+            return f"{self.email} ({self.student.unique_id})"
+        else:
+            return f"{self.email} (admin)"  # For users without student records
+
 
     @property
     def has_password_set(self):
