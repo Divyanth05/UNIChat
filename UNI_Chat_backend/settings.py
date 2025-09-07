@@ -310,3 +310,48 @@ LOGGING = {
         },
     },
 }
+
+
+
+
+# Celery Configuration
+CELERY_BROKER_URL = config('CELERY_BROKER_URL', default=REDIS_URL)
+CELERY_RESULT_BACKEND = config('CELERY_RESULT_BACKEND', default=REDIS_URL)
+
+# Celery Task Settings
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_ENABLE_UTC = True
+
+# Task Routing - Different queues for different types of tasks
+CELERY_TASK_ROUTES = {
+    'apps.files.tasks.process_file_upload': {'queue': 'file_processing'},
+    'apps.files.tasks.cleanup_temp_files': {'queue': 'cleanup'},
+}
+
+# Worker Settings
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_ACKS_LATE = True
+
+# Task Time Limits
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_TASK_SOFT_TIME_LIMIT = 25 * 60  # 25 minutes
+
+# Retry Settings
+CELERY_TASK_RETRY_DELAY = 60  # 1 minute
+CELERY_TASK_MAX_RETRIES = 3
+
+# File Upload Settings (for Celery tasks)
+CELERY_TEMP_FILE_DIR = BASE_DIR / 'temp_uploads'
+CELERY_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+CELERY_ALLOWED_FILE_TYPES = {
+    # Images
+    'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+    # Documents  
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'text/plain', 'text/csv'
+}

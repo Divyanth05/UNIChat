@@ -12,16 +12,18 @@ from django.shortcuts import get_object_or_404
 from django.db import transaction
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
+from django.conf import settings
 
 from .models import ChatFile
 from apps.chat.models import Conversation, ConversationMembership, Message
+from .tasks import process_file_upload  # Import Celery task
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser])
 def upload_file(request):
     """
-    Upload file to conversation
+    Upload file to conversation with Celery background processing
     
     POST /api/v1/files/upload/
     Content-Type: multipart/form-data
@@ -30,6 +32,11 @@ def upload_file(request):
     - file: File to upload
     - conversation_id: UUID of conversation
     - message_content: Optional message text (default: filename)
+    
+    NEW BEHAVIOR: 
+    - Returns immediately after validation and temp storage
+    - File processing happens in background via Celery
+    - Other users see file only when fully processed (invisible upload)
     """
     try:
         # Get form data
@@ -68,81 +75,61 @@ def upload_file(request):
                 'error': validation_result['error']
             }, status=status.HTTP_400_BAD_REQUEST)
         
-        # Process file upload
-        with transaction.atomic():
-            # Generate unique filename
-            file_extension = os.path.splitext(uploaded_file.name)[1].lower()
-            unique_filename = f"{uuid.uuid4().hex}{file_extension}"
-            
-            # Determine file type
-            mime_type = validation_result['mime_type']
-            file_type = get_file_type_from_mime(mime_type)
-            
-            # Save file to S3
-            file_path = f"chat_files/{unique_filename}"
-            saved_path = default_storage.save(file_path, uploaded_file)
-            file_url = default_storage.url(saved_path)
-            
-            # Create thumbnail for images (optional)
-            thumbnail_url = None
-            if file_type == 'image':
-                try:
-                    thumbnail_url = create_image_thumbnail(uploaded_file, unique_filename)
-                except Exception as e:
-                    print(f"Thumbnail creation failed: {str(e)}")
-            
-            # Create ChatFile record
-            chat_file = ChatFile.objects.create(
-                original_name=uploaded_file.name,
-                file_name=unique_filename,
-                file_size=uploaded_file.size,
-                file_type=file_type,
-                mime_type=mime_type,
-                file_url=file_url,
-                thumbnail_url=thumbnail_url,
-                uploaded_by=request.user,
-                conversation=conversation,
-                upload_complete=True
-            )
-            
-            # Create message with file attachment
-            if not message_content:
-                message_content = f"📎 {uploaded_file.name}"
-            
-            message = Message.objects.create(
-                conversation=conversation,
-                sender=request.user,
-                content=message_content,
-                message_type='file',
-                file_url=file_url,
-                file_name=uploaded_file.name,
-                file_size=uploaded_file.size,
-                file_type=mime_type
-            )
-            
-            print(f"File uploaded: {uploaded_file.name} by {request.user.email}")
+        # FAST OPERATIONS: Prepare for background processing
         
-        # Broadcast file message via WebSocket
-        broadcast_file_message(message, chat_file)
+        # Generate unique filename
+        file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+        unique_filename = f"{uuid.uuid4().hex}{file_extension}"
         
+        # Determine file type
+        mime_type = validation_result['mime_type']
+        file_type = get_file_type_from_mime(mime_type)
+        
+        # FAST: Save file to temporary location (0.1 seconds)
+        temp_uploads_dir = getattr(settings, 'CELERY_TEMP_FILE_DIR', settings.BASE_DIR / 'temp_uploads')
+        os.makedirs(temp_uploads_dir, exist_ok=True)
+        
+        temp_filename = f"temp_upload_{uuid.uuid4().hex}{file_extension}"
+        temp_file_path = os.path.join(temp_uploads_dir, temp_filename)
+        
+        # Save uploaded file to temporary location
+        with open(temp_file_path, 'wb') as temp_file:
+            for chunk in uploaded_file.chunks():
+                temp_file.write(chunk)
+        
+        # Prepare file metadata for background task
+        file_data = {
+            'original_name': uploaded_file.name,
+            'unique_filename': unique_filename,
+            'file_size': uploaded_file.size,
+            'file_type': file_type,
+            'mime_type': mime_type,
+            'message_content': message_content or f"📎 {uploaded_file.name}"
+        }
+        
+        # FAST: Queue background task (0.01 seconds)
+        task = process_file_upload.delay(
+            temp_file_path=temp_file_path,
+            conversation_id=str(conversation_id),
+            user_id=request.user.id,
+            file_data=file_data
+        )
+        
+        print(f"File upload queued: {uploaded_file.name} by {request.user.email} (Task ID: {task.id})")
+        
+        # IMMEDIATE RESPONSE: User gets response in ~0.12 seconds
         return Response({
-            'message': 'File uploaded successfully',
-            'file': {
-                'id': str(chat_file.id),
-                'original_name': chat_file.original_name,
-                'file_size': chat_file.file_size,
-                'file_size_human': chat_file.file_size_human,
-                'file_type': chat_file.file_type,
-                'mime_type': chat_file.mime_type,
-                'file_url': chat_file.file_url,
-                'thumbnail_url': chat_file.thumbnail_url
-            },
-            'message_data': {
-                'id': str(message.id),
-                'content': message.content,
-                'timestamp': message.timestamp.isoformat()
+            'status': 'upload_started',
+            'message': f'File "{uploaded_file.name}" is being processed in background...',
+            'task_id': task.id,
+            'file_info': {
+                'original_name': uploaded_file.name,
+                'file_size': uploaded_file.size,
+                'file_size_human': f"{uploaded_file.size / (1024*1024):.1f} MB" if uploaded_file.size > 1024*1024 else f"{uploaded_file.size / 1024:.1f} KB",
+                'file_type': file_type,
+                'mime_type': mime_type
             }
-        }, status=status.HTTP_201_CREATED)
+        }, status=status.HTTP_202_ACCEPTED)  # 202 = Accepted, Processing
         
     except Exception as e:
         print(f"File upload error: {str(e)}")
@@ -208,83 +195,7 @@ def get_file_type_from_mime(mime_type):
         return 'document'
 
 
-def create_image_thumbnail(image_file, unique_filename):
-    """Create thumbnail for image files (optional - requires Pillow)"""
-    try:
-        from PIL import Image
-        from io import BytesIO
-        from django.core.files.base import ContentFile
-        
-        # Open image
-        img = Image.open(image_file)
-        
-        # Create thumbnail
-        img.thumbnail((300, 300), Image.Resampling.LANCZOS)
-        
-        # Save thumbnail to bytes
-        thumb_io = BytesIO()
-        img_format = img.format or 'JPEG'
-        img.save(thumb_io, format=img_format, quality=85)
-        thumb_io.seek(0)
-        
-        # Upload thumbnail to S3
-        thumb_filename = f"thumb_{unique_filename}"
-        thumb_path = f"thumbnails/{thumb_filename}"
-        thumb_file = ContentFile(thumb_io.getvalue())
-        
-        saved_thumb_path = default_storage.save(thumb_path, thumb_file)
-        thumbnail_url = default_storage.url(saved_thumb_path)
-        
-        return thumbnail_url
-        
-    except ImportError:
-        print("Pillow not installed - skipping thumbnail generation")
-        return None
-    except Exception as e:
-        print(f"Thumbnail creation error: {str(e)}")
-        return None
 
-
-def broadcast_file_message(message, chat_file):
-    """Broadcast file message to all conversation members via WebSocket"""
-    try:
-        channel_layer = get_channel_layer()
-        group_name = f"conversation_{message.conversation.id}"
-        
-        # Prepare message data for WebSocket
-        message_data = {
-            'id': str(message.id),
-            'conversation_id': str(message.conversation.id),
-            'sender': {
-                'id': message.sender.id,
-                'email': message.sender.email,
-                'full_name': f"{message.sender.first_name} {message.sender.last_name}".strip()
-            },
-            'content': message.content,
-            'message_type': message.message_type,
-            'timestamp': message.timestamp.isoformat(),
-            'file_data': {
-                'id': str(chat_file.id),
-                'original_name': chat_file.original_name,
-                'file_size': chat_file.file_size,
-                'file_size_human': chat_file.file_size_human,
-                'file_type': chat_file.file_type,
-                'mime_type': chat_file.mime_type,
-                'file_url': chat_file.file_url,
-                'thumbnail_url': chat_file.thumbnail_url
-            }
-        }
-        
-        # Send to WebSocket group
-        async_to_sync(channel_layer.group_send)(group_name, {
-            'type': 'file_message',
-            'message': message_data
-        })
-        
-        print(f"File message broadcasted to conversation {message.conversation.id}")
-        
-    except Exception as e:
-        print(f"Error broadcasting file message: {str(e)}")
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -293,6 +204,8 @@ def download_file(request, file_id):
     Get file download URL with permission check
     
     GET /api/v1/files/{file_id}/download/
+    
+    UNCHANGED: This function works exactly the same with Celery
     """
     try:
         chat_file = get_object_or_404(ChatFile, id=file_id)
@@ -333,4 +246,48 @@ def download_file(request, file_id):
         print(f"File download error: {str(e)}")
         return Response({
             'error': 'Failed to access file'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def upload_status(request, task_id):
+    """
+    Check status of background file upload task
+    
+    GET /api/v1/files/upload-status/{task_id}/
+    
+    NEW ENDPOINT: Check if background upload is complete
+    """
+    try:
+        from celery.result import AsyncResult
+        
+        task_result = AsyncResult(task_id)
+        
+        if task_result.state == 'PENDING':
+            return Response({
+                'status': 'processing',
+                'message': 'File is still being processed...'
+            })
+        elif task_result.state == 'SUCCESS':
+            return Response({
+                'status': 'completed',
+                'message': 'File uploaded successfully!',
+                'result': task_result.result
+            })
+        elif task_result.state == 'FAILURE':
+            return Response({
+                'status': 'failed', 
+                'message': 'File upload failed',
+                'error': str(task_result.info)
+            })
+        else:
+            return Response({
+                'status': task_result.state,
+                'message': f'Upload status: {task_result.state}'
+            })
+            
+    except Exception as e:
+        return Response({
+            'error': 'Failed to check upload status'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

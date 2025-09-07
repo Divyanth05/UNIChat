@@ -9,4 +9,7 @@ urlpatterns = [
     
     # File download endpoint  
     path('<uuid:file_id>/download/', views.download_file, name='download_file'),
+    
+    # Upload status endpoint (NEW)
+    path('upload-status/<str:task_id>/', views.upload_status, name='upload_status'),
 ]

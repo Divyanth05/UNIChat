@@ -23,20 +23,17 @@ from django.db import transaction
 from django.utils import timezone
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
-from channels.db import database_sync_to_async
-from asgiref.sync import sync_to_async
+
 from django.db import transaction
 from django.utils import timezone
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
-from channels.db import database_sync_to_async
-from asgiref.sync import sync_to_async
 
 
 #USER AUTHENTICATION END POINTS
 @api_view(['POST'])
 @permission_classes([AllowAny])
-async def check_email(request):
+def check_email(request):
     """
     Smart Authentication Step 1: Check if email exists and determine next action
     
@@ -74,7 +71,7 @@ async def check_email(request):
     
     try:
         # Step 1: Check if student exists with this email
-        student = await Student.objects.select_related('university').get(email=email) 
+        student = Student.objects.select_related('university').get(email=email) 
         #how university name  is fetched ny using joins by django . it similar to join in sql. equilavent to student= students.objects.get(email=email) and university_name=student.university.name
         #Get the student AND their university data in ONE database query using a JOIN, so I don't have to make a second query later.
         print(f"✅ Student found: {student.unique_id} - {student.first_name} {student.last_name}")
